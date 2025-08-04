@@ -9,19 +9,19 @@ export function Footer() {
     {
       name: 'GitHub',
       icon: Github,
-      href: 'https://github.com/yourusername', // Replace with your GitHub
+      href: 'https://github.com/joevarghese867-code', // Replace with your GitHub
       color: 'hover:text-gray-900'
     },
     {
       name: 'Twitter',
       icon: Twitter,
-      href: 'https://twitter.com/yourusername', // Replace with your Twitter
+      href: 'https://twitter.com/0xjumba', // Replace with your Twitter
       color: 'hover:text-blue-400'
     },
     {
       name: 'Email',
       icon: Mail,
-      href: 'mailto:your.email@example.com', // Replace with your email
+      href: 'mailto:joevarghese867@gmail.com', // Replace with your email
       color: 'hover:text-red-400'
     }
   ]
