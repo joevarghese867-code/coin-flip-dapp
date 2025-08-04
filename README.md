@@ -2,6 +2,9 @@
 
 A decentralized coin flip betting game built on Solana blockchain using Anchor framework. Double your SOL or lose it all!
 
+# Website link
+https://coin-flip-dapp-bice.vercel.app/
+
 ![Coin Flip Game Interface](image.png)
 
 ## 🎮 Game Overview
