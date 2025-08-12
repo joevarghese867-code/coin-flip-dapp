@@ -1,7 +1,8 @@
+// src/components/coin-flip/CoinFlipGame.tsx
 'use client'
 
 import { PublicKey } from '@solana/web3.js'
-import { useMemo, useState, useEffect } from 'react'
+import { useMemo, useState, useEffect, useCallback } from 'react'
 import { useCoinFlipProgram, useCoinFlipProgramAccount } from './coin-flip-data-access'
 import { Button } from '@/components/ui/button'
 import { useWallet } from '@solana/wallet-adapter-react'
@@ -245,6 +246,7 @@ function RecentActivityList() {
 
 function BettingInterface() {
   const wallet = useWallet()
+  const { connection } = useConnection()
   const { globalGameStateQuery, globalGameState, program, programId } = useCoinFlipProgram()
   
   const [betChoice, setBetChoice] = useState<number>(0)
@@ -252,6 +254,8 @@ function BettingInterface() {
   const [betResult, setBetResult] = useState<null | 'won' | 'lost' | 'pending'>(null)
   const [showAnimation, setShowAnimation] = useState(false)
   const [animationResult, setAnimationResult] = useState<'heads' | 'tails' | null>(null)
+  const [isProcessing, setIsProcessing] = useState(false)
+  const [transactionSignature, setTransactionSignature] = useState<string | null>(null)
 
   const gameStateData = globalGameStateQuery.data
 
@@ -278,20 +282,26 @@ function BettingInterface() {
     }
   }, [betAccountQuery.accountQuery.data])
 
-  useEffect(() => {
-    if (betResult === 'won' || betResult === 'lost') {
-      setTimeout(() => {
-        setShowAnimation(false)
-        setBetResult(null)
-        setAnimationResult(null)
-        // Clear the bet resolving state when animation completes
-        globalBetResolutionState.setBetResolving(false)
-      }, 8000)
-    }
-  }, [betResult])
+  // Improved bet result checking with better error handling
+  const checkBetResult = useCallback(async (gameNumber: number, signature: string) => {
+    if (!wallet.publicKey || !program || !programId || !connection) return
 
-  const checkBetResult = async (gameNumber: number) => {
-    if (!wallet.publicKey || !program || !programId) return
+    console.log(`Starting bet result check for game ${gameNumber} with signature ${signature}`)
+
+    // First, wait for transaction confirmation
+    try {
+      console.log('Waiting for transaction confirmation...')
+      const latestBlockhash = await connection.getLatestBlockhash('confirmed')
+      await connection.confirmTransaction({
+        signature,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+      }, 'confirmed')
+      console.log('Transaction confirmed')
+    } catch (confirmError) {
+      console.log('Transaction confirmation error:', confirmError)
+      // Continue anyway, the transaction might still be processed
+    }
 
     const gameNumberBuf = new BN(gameNumber).toArrayLike(Buffer, 'le', 8)
     const [correctBetAccount] = PublicKey.findProgramAddressSync(
@@ -300,71 +310,128 @@ function BettingInterface() {
     )
 
     let attempts = 0
-    const maxAttempts = 10
+    const maxAttempts = 20 // Increased attempts for devnet
+    let lastError: any = null
 
     const attemptFetch = async () => {
       attempts++
+      console.log(`Fetch attempt ${attempts}/${maxAttempts}`)
       
       try {
+        // Add a small delay between attempts
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        
         const betData = await (program.account as any).betAccount.fetch(correctBetAccount)
+        console.log('Fetched bet data:', {
+          settled: betData?.settled,
+          won: betData?.won,
+          choice: betData?.choice
+        })
         
         if (betData?.settled) {
+          // Determine the actual coin flip result based on whether the user won
           const coinResult = betData.won 
-            ? (betChoice === 0 ? 'heads' : 'tails')
-            : (betChoice === 0 ? 'tails' : 'heads')
+            ? (betChoice === 0 ? 'heads' : 'tails')  // User won, coin landed on their choice
+            : (betChoice === 0 ? 'tails' : 'heads')  // User lost, coin landed opposite
+          
+          console.log(`Bet settled! User ${betData.won ? 'won' : 'lost'}. Coin result: ${coinResult}`)
           
           setAnimationResult(coinResult)
           setBetResult(betData.won ? 'won' : 'lost')
+          setIsProcessing(false)
+          
+          // Refetch game state data
           globalGameStateQuery.refetch()
+          betAccountQuery.accountQuery.refetch()
+          
           return
         }
         
         if (attempts < maxAttempts) {
+          console.log(`Bet not settled yet, retrying in 2 seconds...`)
           setTimeout(attemptFetch, 2000)
         } else {
-          setBetResult(null)
-          setShowAnimation(false)
-          globalBetResolutionState.setBetResolving(false)
+          console.log('Max attempts reached, giving up')
+          throw new Error('Max fetch attempts reached')
         }
       } catch (error) {
+        lastError = error
+        console.log(`Fetch error on attempt ${attempts}:`, error)
+        
         if (attempts < maxAttempts) {
-          setTimeout(attemptFetch, 2000)
+          console.log(`Retrying in 3 seconds...`)
+          setTimeout(attemptFetch, 3000)
         } else {
-          setBetResult(null)
-          setShowAnimation(false)
-          globalBetResolutionState.setBetResolving(false)
+          console.log('Max attempts reached with errors')
+          throw error
         }
       }
     }
 
-    setTimeout(attemptFetch, 3000)
-  }
+    try {
+      // Start checking after a short delay to allow transaction processing
+      setTimeout(attemptFetch, 2000)
+    } catch (error) {
+      console.error('Failed to check bet result:', error)
+      setBetResult(null)
+      setShowAnimation(false)
+      setIsProcessing(false)
+      globalBetResolutionState.setBetResolving(false)
+      
+      // Show a fallback message to check balance manually
+      alert('Transaction completed but result check failed. Please refresh the page to see your result.')
+    }
+  }, [wallet.publicKey, program, programId, connection, betChoice, globalGameStateQuery, betAccountQuery.accountQuery])
+
+  useEffect(() => {
+    if (betResult === 'won' || betResult === 'lost') {
+      const timer = setTimeout(() => {
+        setShowAnimation(false)
+        setBetResult(null)
+        setAnimationResult(null)
+        setTransactionSignature(null)
+        globalBetResolutionState.setBetResolving(false)
+      }, 8000)
+      
+      return () => clearTimeout(timer)
+    }
+  }, [betResult])
 
   const handlePlaceBet = async () => {
     if (!wallet.publicKey || !placeBetAmount || placeBetAmount <= 0) {
       return
     }
 
+    console.log('Starting bet placement...')
+    setIsProcessing(true)
     setShowAnimation(true)
     setAnimationResult(null)
     setBetResult('pending')
-    // Set global bet resolving state
+    setTransactionSignature(null)
     globalBetResolutionState.setBetResolving(true)
     
     const amountLamports = placeBetAmount * LAMPORTS_PER_SOL
 
     try {
       const gameNumberForBet = betAccountQuery.currentGameNumber
+      console.log(`Placing bet for game number: ${gameNumberForBet}`)
       
-      await betAccountQuery.placeBet.mutateAsync({
+      const signature = await betAccountQuery.placeBet.mutateAsync({
         amount: amountLamports,
         choice: betChoice
       })
       
-      checkBetResult(gameNumberForBet)
+      console.log(`Bet transaction submitted with signature: ${signature}`)
+      setTransactionSignature(signature)
+      
+      // Start checking for result
+      checkBetResult(gameNumberForBet, signature)
     } catch (error) {
+      console.error('Bet placement failed:', error)
       setBetResult(null)
       setShowAnimation(false)
+      setIsProcessing(false)
+      setTransactionSignature(null)
       globalBetResolutionState.setBetResolving(false)
     }
   }
@@ -375,7 +442,7 @@ function BettingInterface() {
 
   return (
     <div className="space-y-6">
-      {existingBetInfo && (
+      {existingBetInfo && !showAnimation && (
         <div className={`text-center p-6 rounded-2xl shadow-lg ${
           existingBetInfo.won 
             ? 'bg-green-50 border-2 border-green-200' 
@@ -402,111 +469,130 @@ function BettingInterface() {
         <div className="p-8">
           <div className="max-w-md mx-auto space-y-6">
             {showAnimation && (
-              <CoinFlipAnimation 
-                isFlipping={betResult === 'pending' || !!animationResult}
-                result={animationResult}
-                userBet={betChoice === 0 ? 'heads' : 'tails'}
-                onAnimationComplete={() => {}}
-              />
-            )}
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-3">
-                Bet Amount
-              </label>
-              <div className="flex items-center gap-3">
-                <input
-                  type="number"
-                  min={0}
-                  step={0.1}
-                  placeholder="0.0"
-                  value={placeBetAmount || ''}
-                  onChange={(e) => setPlaceBetAmount(Number(e.target.value))}
-                  disabled={betAccountQuery.placeBet.isPending || showAnimation}
-                  className="flex-1 px-4 py-3 border border-gray-300 rounded-lg text-lg font-semibold text-center focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              <div className="space-y-4">
+                <CoinFlipAnimation 
+                  isFlipping={betResult === 'pending' || !!animationResult}
+                  result={animationResult}
+                  userBet={betChoice === 0 ? 'heads' : 'tails'}
+                  onAnimationComplete={() => {}}
                 />
-                <span className="text-lg font-medium text-gray-600">SOL</span>
-              </div>
-              
-              <div className="flex gap-2 mt-3">
-                {[0.1, 0.5, 1.0].map(amount => (
-                  <button
-                    key={amount}
-                    onClick={() => setPlaceBetAmount(amount)}
-                    disabled={betAccountQuery.placeBet.isPending || showAnimation}
-                    className="flex-1 py-2 text-sm bg-gray-100 hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-colors"
-                  >
-                    {amount} SOL
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {placeBetAmount > 0 && !showAnimation && (
-              <div className="bg-yellow-50 border-2 border-yellow-200 rounded-xl p-4 text-center">
-                <p className="text-lg font-semibold text-yellow-800">
-                  Potential Winnings: {potentialWinnings.toFixed(4)} SOL
-                </p>
-                <p className="text-sm text-yellow-700">
-                  2x your bet minus {gameStateData.feePercentage.toString()}% house fee
-                </p>
-              </div>
-            )}
-
-            <div className="space-y-3">
-              <label className="block text-sm font-medium text-gray-700 text-center">
-                Choose Your Side
-              </label>
-              <div className="grid grid-cols-2 gap-4">
-                <button
-                  onClick={() => setBetChoice(0)}
-                  disabled={betAccountQuery.placeBet.isPending || showAnimation}
-                  className={`p-6 rounded-xl border-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
-                    betChoice === 0
-                      ? 'border-orange-500 bg-orange-50 text-orange-700'
-                      : 'border-gray-200 hover:border-gray-300 text-gray-700'
-                  }`}
-                >
-                  <div className="text-4xl mb-2">🪙</div>
-                  <div className="font-semibold">Heads</div>
-                </button>
                 
-                <button
-                  onClick={() => setBetChoice(1)}
-                  disabled={betAccountQuery.placeBet.isPending || showAnimation}
-                  className={`p-6 rounded-xl border-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
-                    betChoice === 1
-                      ? 'border-blue-500 bg-blue-50 text-blue-700'
-                      : 'border-gray-200 hover:border-gray-300 text-gray-700'
-                  }`}
-                >
-                  <div className="text-4xl mb-2">🎯</div>
-                  <div className="font-semibold">Tails</div>
-                </button>
-              </div>
-            </div>
-
-            <Button
-              onClick={handlePlaceBet}
-              disabled={betAccountQuery.placeBet.isPending || !placeBetAmount || placeBetAmount <= 0 || !wallet.publicKey || showAnimation}
-              className="w-full py-4 text-lg font-bold bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {showAnimation ? 'Flipping...' : '🎲 Flip the Coin!'}
-            </Button>
-
-            {!showAnimation && betResult === 'won' && (
-              <div className="text-center p-4 bg-green-50 rounded-xl border-2 border-green-200">
-                <div className="text-3xl mb-2">🎉</div>
-                <p className="text-green-600 font-bold text-lg">You Won!</p>
-                <p className="text-sm text-gray-600 mt-1">Your winnings have been credited!</p>
+                {/* Transaction status */}
+                {transactionSignature && (
+                  <div className="text-center p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                    <p className="text-sm text-blue-800">
+                      Transaction: <code className="text-xs">{transactionSignature.slice(0, 8)}...{transactionSignature.slice(-8)}</code>
+                    </p>
+                    <p className="text-xs text-blue-600 mt-1">
+                      {isProcessing ? 'Processing...' : 'Completed!'}
+                    </p>
+                  </div>
+                )}
+                
+                {/* Backup message if taking too long */}
+                {isProcessing && betResult === 'pending' && (
+                  <div className="text-center p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                    <p className="text-sm text-yellow-800">
+                      Taking longer than expected? Check your wallet balance after the animation completes.
+                    </p>
+                  </div>
+                )}
               </div>
             )}
-            {!showAnimation && betResult === 'lost' && (
-              <div className="text-center p-4 bg-red-50 rounded-xl border-2 border-red-200">
-                <div className="text-3xl mb-2">😢</div>
-                <p className="text-red-600 font-bold text-lg">You Lost!</p>
-                <p className="text-sm text-gray-600 mt-1">Better luck next time!</p>
-              </div>
+
+            {!showAnimation && (
+              <>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-3">
+                    Bet Amount
+                  </label>
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.1}
+                      placeholder="0.0"
+                      value={placeBetAmount || ''}
+                      onChange={(e) => setPlaceBetAmount(Number(e.target.value))}
+                      disabled={betAccountQuery.placeBet.isPending}
+                      className="flex-1 px-4 py-3 border border-gray-300 rounded-lg text-lg font-semibold text-center focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    />
+                    <span className="text-lg font-medium text-gray-600">SOL</span>
+                  </div>
+                  
+                  <div className="flex gap-2 mt-3">
+                    {[0.1, 0.5, 1.0].map(amount => (
+                      <button
+                        key={amount}
+                        onClick={() => setPlaceBetAmount(amount)}
+                        disabled={betAccountQuery.placeBet.isPending}
+                        className="flex-1 py-2 text-sm bg-gray-100 hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-colors"
+                      >
+                        {amount} SOL
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {placeBetAmount > 0 && (
+                  <div className="bg-yellow-50 border-2 border-yellow-200 rounded-xl p-4 text-center">
+                    <p className="text-lg font-semibold text-yellow-800">
+                      Potential Winnings: {potentialWinnings.toFixed(4)} SOL
+                    </p>
+                    <p className="text-sm text-yellow-700">
+                      2x your bet minus {gameStateData.feePercentage.toString()}% house fee
+                    </p>
+                  </div>
+                )}
+
+                <div className="space-y-3">
+                  <label className="block text-sm font-medium text-gray-700 text-center">
+                    Choose Your Side
+                  </label>
+                  <div className="grid grid-cols-2 gap-4">
+                    <button
+                      onClick={() => setBetChoice(0)}
+                      disabled={betAccountQuery.placeBet.isPending}
+                      className={`p-6 rounded-xl border-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                        betChoice === 0
+                          ? 'border-orange-500 bg-orange-50 text-orange-700'
+                          : 'border-gray-200 hover:border-gray-300 text-gray-700'
+                      }`}
+                    >
+                      <div className="text-4xl mb-2">🪙</div>
+                      <div className="font-semibold">Heads</div>
+                    </button>
+                    
+                    <button
+                      onClick={() => setBetChoice(1)}
+                      disabled={betAccountQuery.placeBet.isPending}
+                      className={`p-6 rounded-xl border-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                        betChoice === 1
+                          ? 'border-blue-500 bg-blue-50 text-blue-700'
+                          : 'border-gray-200 hover:border-gray-300 text-gray-700'
+                      }`}
+                    >
+                      <div className="text-4xl mb-2">🎯</div>
+                      <div className="font-semibold">Tails</div>
+                    </button>
+                  </div>
+                </div>
+
+                <Button
+                  onClick={handlePlaceBet}
+                  disabled={betAccountQuery.placeBet.isPending || !placeBetAmount || placeBetAmount <= 0 || !wallet.publicKey}
+                  className="w-full py-4 text-lg font-bold bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {betAccountQuery.placeBet.isPending ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Submitting...
+                    </>
+                  ) : (
+                    '🎲 Flip the Coin!'
+                  )}
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -518,7 +604,6 @@ function BettingInterface() {
 function GameStats({ gameData }: { gameData: any }) {
   const [isBetResolving, setIsBetResolving] = useState(false)
 
-  // Check for bet resolution state periodically
   useEffect(() => {
     const interval = setInterval(() => {
       setIsBetResolving(globalBetResolutionState.isResolving)
